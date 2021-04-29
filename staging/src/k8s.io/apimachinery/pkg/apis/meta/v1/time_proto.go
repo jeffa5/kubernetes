@@ -45,7 +45,7 @@ func (m *Time) ProtoTime() *Timestamp {
 		// leaving this here for the record.  our JSON only handled seconds, so this results in writes by
 		// protobuf clients storing values that aren't read by json clients, which results in unexpected
 		// field mutation, which fails various validation and equality code.
-		// Nanos:   int32(m.Time.Nanosecond()),
+		Nanos: int32(m.Time.Nanosecond()),
 	}
 }
 
@@ -71,7 +71,7 @@ func (m *Time) Unmarshal(data []byte) error {
 	// protobuf clients storing values that aren't read by json clients, which results in unexpected
 	// field mutation, which fails various validation and equality code.
 	// m.Time = time.Unix(p.Seconds, int64(p.Nanos)).Local()
-	m.Time = time.Unix(p.Seconds, int64(0)).Local()
+	m.Time = time.Unix(p.Seconds, int64(p.Nanos)).Local()
 	return nil
 }
 
