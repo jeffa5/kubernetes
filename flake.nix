@@ -22,6 +22,7 @@
 
               go
               etcd_3_4
+              kind
               openssl
 
               rnix-lsp
