@@ -34,7 +34,7 @@ import (
 )
 
 const (
-	maxLruCacheEntries = 4096
+	maxLruCacheEntries = 1
 
 	// if we see the same event that varies only by message
 	// more than 10 times in a 10 minute period, aggregate the event
@@ -453,7 +453,7 @@ func NewEventCorrelatorWithOptions(options CorrelatorOptions) *EventCorrelator {
 	return &EventCorrelator{
 		filterFunc: spamFilter.Filter,
 		aggregator: NewEventAggregator(
-			optionsWithDefaults.LRUCacheSize,
+			maxLruCacheEntries,
 			optionsWithDefaults.KeyFunc,
 			optionsWithDefaults.MessageFunc,
 			optionsWithDefaults.MaxEvents,
