@@ -406,7 +406,6 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 
 	logger.Info("schedulePod")
 
-	// TODO: send pod and list of nodes to scheduler
 	request := make(map[string]any)
 	request["pod"] = pod
 	request["nodes"] = nodes
@@ -457,7 +456,6 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 	}
 	logger.Info("got response", "response", res)
 
-	// TODO: handle body
 	result.SuggestedHost = res.NodeName
 	return result, nil
 
