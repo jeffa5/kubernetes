@@ -17,11 +17,15 @@ limitations under the License.
 package scheduler
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"net/http"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -392,13 +396,72 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, ErrNoNodesAvailable
 	}
 
-	feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
+	nodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
 	if err != nil {
 		return result, err
 	}
 	trace.Step("Computing predicates done")
 
-	if len(feasibleNodes) == 0 {
+	logger := klog.FromContext(ctx)
+
+	logger.Info("schedulePod")
+
+	// TODO: send pod and list of nodes to scheduler
+	request := make(map[string]any)
+	request["pod"] = pod
+	request["nodes"] = nodes
+	logger.Info("nodes", "nodes", nodes)
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return result, err
+	}
+	url := "http://localhost:7070/scheduler"
+	logger.Info(url)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestJSON))
+	if err != nil {
+		logger.Info("failed building request")
+		logger.Error(err, "building request")
+		return result, err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+	logger.Info("sending request")
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Info("failed sending request")
+		logger.Error(err, "sending request")
+		return result, err
+	}
+	logger.Info("reading response body")
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Error(err, "reading response")
+		return result, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		logger.Info("failed request", "status", resp.StatusCode, "body", body)
+		return result, errors.New("failed to send request")
+	}
+
+	type Resp struct {
+		NodeName string `json:"node_name"`
+	}
+	logger.Info("parsing response")
+	var res Resp
+	err = json.Unmarshal(body, &res)
+	if err != nil {
+		logger.Info("failed parsing response")
+		return result, err
+	}
+	logger.Info("got response", "response", res)
+
+	// TODO: handle body
+	result.SuggestedHost = res.NodeName
+	return result, nil
+
+	if len(nodes) == 0 {
 		return result, &framework.FitError{
 			Pod:         pod,
 			NumAllNodes: sched.nodeInfoSnapshot.NumNodes(),
@@ -407,15 +470,15 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 	}
 
 	// When only one node after predicate, just use it.
-	if len(feasibleNodes) == 1 {
+	if len(nodes) == 1 {
 		return ScheduleResult{
-			SuggestedHost:  feasibleNodes[0].Name,
+			SuggestedHost:  nodes[0].Name,
 			EvaluatedNodes: 1 + len(diagnosis.NodeToStatusMap),
 			FeasibleNodes:  1,
 		}, nil
 	}
 
-	priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, feasibleNodes)
+	priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, nodes)
 	if err != nil {
 		return result, err
 	}
@@ -425,8 +488,8 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 
 	return ScheduleResult{
 		SuggestedHost:  host,
-		EvaluatedNodes: len(feasibleNodes) + len(diagnosis.NodeToStatusMap),
-		FeasibleNodes:  len(feasibleNodes),
+		EvaluatedNodes: len(nodes) + len(diagnosis.NodeToStatusMap),
+		FeasibleNodes:  len(nodes),
 	}, err
 }
 
@@ -443,67 +506,76 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, fwk framework.F
 	if err != nil {
 		return nil, diagnosis, err
 	}
-	// Run "prefilter" plugins.
-	preRes, s := fwk.RunPreFilterPlugins(ctx, state, pod)
-	if !s.IsSuccess() {
-		if !s.IsUnschedulable() {
-			return nil, diagnosis, s.AsError()
+	// // Run "prefilter" plugins.
+	// preRes, s := fwk.RunPreFilterPlugins(ctx, state, pod)
+	// if !s.IsSuccess() {
+	// 	if !s.IsUnschedulable() {
+	// 		return nil, diagnosis, s.AsError()
+	// 	}
+	// 	// All nodes in NodeToStatusMap will have the same status so that they can be handled in the preemption.
+	// 	// Some non trivial refactoring is needed to avoid this copy.
+	// 	for _, n := range allNodes {
+	// 		diagnosis.NodeToStatusMap[n.Node().Name] = s
+	// 	}
+	//
+	// 	// Record the messages from PreFilter in Diagnosis.PreFilterMsg.
+	// 	msg := s.Message()
+	// 	diagnosis.PreFilterMsg = msg
+	// 	logger.V(5).Info("Status after running PreFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+	// 	// Status satisfying IsUnschedulable() gets injected into diagnosis.UnschedulablePlugins.
+	// 	if s.FailedPlugin() != "" {
+	// 		diagnosis.UnschedulablePlugins.Insert(s.FailedPlugin())
+	// 	}
+	// 	return nil, diagnosis, nil
+	// }
+	//
+	// // "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
+	// // This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
+	// if len(pod.Status.NominatedNodeName) > 0 {
+	// 	feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, fwk, state, diagnosis)
+	// 	if err != nil {
+	// 		logger.Error(err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
+	// 	}
+	// 	// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
+	// 	if len(feasibleNodes) != 0 {
+	// 		return feasibleNodes, diagnosis, nil
+	// 	}
+	// }
+	//
+	// nodes := allNodes
+	// if !preRes.AllNodes() {
+	// 	nodes = make([]*framework.NodeInfo, 0, len(preRes.NodeNames))
+	// 	for n := range preRes.NodeNames {
+	// 		nInfo, err := sched.nodeInfoSnapshot.NodeInfos().Get(n)
+	// 		if err != nil {
+	// 			return nil, diagnosis, err
+	// 		}
+	// 		nodes = append(nodes, nInfo)
+	// 	}
+	// }
+	// feasibleNodes, err := sched.findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, nodes)
+	// // always try to update the sched.nextStartNodeIndex regardless of whether an error has occurred
+	// // this is helpful to make sure that all the nodes have a chance to be searched
+	// processedNodes := len(feasibleNodes) + len(diagnosis.NodeToStatusMap)
+	// sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(nodes)
+	// if err != nil {
+	// 	return nil, diagnosis, err
+	// }
+	//
+	// feasibleNodes, err = findNodesThatPassExtenders(ctx, sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatusMap)
+	// if err != nil {
+	// 	return nil, diagnosis, err
+	// }
+	var nodes []*v1.Node
+	for _, node := range allNodes {
+		node := node
+		n := node.Node()
+		logger.Info("node", "node", n)
+		if n != nil {
+			nodes = append(nodes, n)
 		}
-		// All nodes in NodeToStatusMap will have the same status so that they can be handled in the preemption.
-		// Some non trivial refactoring is needed to avoid this copy.
-		for _, n := range allNodes {
-			diagnosis.NodeToStatusMap[n.Node().Name] = s
-		}
-
-		// Record the messages from PreFilter in Diagnosis.PreFilterMsg.
-		msg := s.Message()
-		diagnosis.PreFilterMsg = msg
-		logger.V(5).Info("Status after running PreFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
-		// Status satisfying IsUnschedulable() gets injected into diagnosis.UnschedulablePlugins.
-		if s.FailedPlugin() != "" {
-			diagnosis.UnschedulablePlugins.Insert(s.FailedPlugin())
-		}
-		return nil, diagnosis, nil
 	}
-
-	// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
-	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
-	if len(pod.Status.NominatedNodeName) > 0 {
-		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, fwk, state, diagnosis)
-		if err != nil {
-			logger.Error(err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
-		}
-		// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
-		if len(feasibleNodes) != 0 {
-			return feasibleNodes, diagnosis, nil
-		}
-	}
-
-	nodes := allNodes
-	if !preRes.AllNodes() {
-		nodes = make([]*framework.NodeInfo, 0, len(preRes.NodeNames))
-		for n := range preRes.NodeNames {
-			nInfo, err := sched.nodeInfoSnapshot.NodeInfos().Get(n)
-			if err != nil {
-				return nil, diagnosis, err
-			}
-			nodes = append(nodes, nInfo)
-		}
-	}
-	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, nodes)
-	// always try to update the sched.nextStartNodeIndex regardless of whether an error has occurred
-	// this is helpful to make sure that all the nodes have a chance to be searched
-	processedNodes := len(feasibleNodes) + len(diagnosis.NodeToStatusMap)
-	sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(nodes)
-	if err != nil {
-		return nil, diagnosis, err
-	}
-
-	feasibleNodes, err = findNodesThatPassExtenders(ctx, sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatusMap)
-	if err != nil {
-		return nil, diagnosis, err
-	}
-	return feasibleNodes, diagnosis, nil
+	return nodes, diagnosis, nil
 }
 
 func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, fwk framework.Framework, state *framework.CycleState, diagnosis framework.Diagnosis) ([]*v1.Node, error) {
