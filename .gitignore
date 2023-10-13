@@ -130,3 +130,5 @@ zz_generated_*_test.go
 vendordiff.patch
 
 .direnv
+
+tests.txt
