@@ -391,75 +391,23 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, err
 	}
 	trace.Step("Snapshotting scheduler cache and node infos done")
+	logger := klog.FromContext(ctx)
 
 	if sched.nodeInfoSnapshot.NumNodes() == 0 {
 		return result, ErrNoNodesAvailable
 	}
 
-	nodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
+	feasibleNodes, diagnosis, err := sched.findNodesThatFitPod(ctx, fwk, state, pod)
 	if err != nil {
 		return result, err
 	}
 	trace.Step("Computing predicates done")
 
-	logger := klog.FromContext(ctx)
-
-	logger.Info("schedulePod")
-
-	request := make(map[string]any)
-	request["pod"] = pod
-	request["nodes"] = nodes
-	logger.Info("nodes", "nodes", nodes)
-	requestJSON, err := json.Marshal(request)
-	if err != nil {
-		return result, err
-	}
-	url := "http://localhost:7070/scheduler"
-	logger.Info(url)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestJSON))
-	if err != nil {
-		logger.Info("failed building request")
-		logger.Error(err, "building request")
-		return result, err
-	}
-	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
-	logger.Info("sending request")
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		logger.Info("failed sending request")
-		logger.Error(err, "sending request")
-		return result, err
-	}
-	logger.Info("reading response body")
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.Error(err, "reading response")
-		return result, err
+	for _, node := range feasibleNodes {
+		logger.Info("feasiblenode", "name", node.Name)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		logger.Info("failed request", "status", resp.StatusCode, "body", body)
-		return result, errors.New("failed to send request")
-	}
-
-	type Resp struct {
-		NodeName string `json:"node_name"`
-	}
-	logger.Info("parsing response")
-	var res Resp
-	err = json.Unmarshal(body, &res)
-	if err != nil {
-		logger.Info("failed parsing response")
-		return result, err
-	}
-	logger.Info("got response", "response", res)
-
-	result.SuggestedHost = res.NodeName
-	return result, nil
-
-	if len(nodes) == 0 {
+	if len(feasibleNodes) == 0 {
 		return result, &framework.FitError{
 			Pod:         pod,
 			NumAllNodes: sched.nodeInfoSnapshot.NumNodes(),
@@ -468,26 +416,26 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 	}
 
 	// When only one node after predicate, just use it.
-	if len(nodes) == 1 {
+	if len(feasibleNodes) == 1 {
 		return ScheduleResult{
-			SuggestedHost:  nodes[0].Name,
+			SuggestedHost:  feasibleNodes[0].Name,
 			EvaluatedNodes: 1 + len(diagnosis.NodeToStatusMap),
 			FeasibleNodes:  1,
 		}, nil
 	}
 
-	priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, nodes)
+	priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, feasibleNodes)
 	if err != nil {
 		return result, err
 	}
 
-	host, _, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
+	host, _, err := selectHost(ctx, priorityList, numberOfHighestScoredNodesToReport)
 	trace.Step("Prioritizing done")
 
 	return ScheduleResult{
 		SuggestedHost:  host,
-		EvaluatedNodes: len(nodes) + len(diagnosis.NodeToStatusMap),
-		FeasibleNodes:  len(nodes),
+		EvaluatedNodes: len(feasibleNodes) + len(diagnosis.NodeToStatusMap),
+		FeasibleNodes:  len(feasibleNodes),
 	}, err
 }
 
@@ -504,76 +452,67 @@ func (sched *Scheduler) findNodesThatFitPod(ctx context.Context, fwk framework.F
 	if err != nil {
 		return nil, diagnosis, err
 	}
-	// // Run "prefilter" plugins.
-	// preRes, s := fwk.RunPreFilterPlugins(ctx, state, pod)
-	// if !s.IsSuccess() {
-	// 	if !s.IsUnschedulable() {
-	// 		return nil, diagnosis, s.AsError()
-	// 	}
-	// 	// All nodes in NodeToStatusMap will have the same status so that they can be handled in the preemption.
-	// 	// Some non trivial refactoring is needed to avoid this copy.
-	// 	for _, n := range allNodes {
-	// 		diagnosis.NodeToStatusMap[n.Node().Name] = s
-	// 	}
-	//
-	// 	// Record the messages from PreFilter in Diagnosis.PreFilterMsg.
-	// 	msg := s.Message()
-	// 	diagnosis.PreFilterMsg = msg
-	// 	logger.V(5).Info("Status after running PreFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
-	// 	// Status satisfying IsUnschedulable() gets injected into diagnosis.UnschedulablePlugins.
-	// 	if s.FailedPlugin() != "" {
-	// 		diagnosis.UnschedulablePlugins.Insert(s.FailedPlugin())
-	// 	}
-	// 	return nil, diagnosis, nil
-	// }
-	//
-	// // "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
-	// // This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
-	// if len(pod.Status.NominatedNodeName) > 0 {
-	// 	feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, fwk, state, diagnosis)
-	// 	if err != nil {
-	// 		logger.Error(err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
-	// 	}
-	// 	// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
-	// 	if len(feasibleNodes) != 0 {
-	// 		return feasibleNodes, diagnosis, nil
-	// 	}
-	// }
-	//
-	// nodes := allNodes
-	// if !preRes.AllNodes() {
-	// 	nodes = make([]*framework.NodeInfo, 0, len(preRes.NodeNames))
-	// 	for n := range preRes.NodeNames {
-	// 		nInfo, err := sched.nodeInfoSnapshot.NodeInfos().Get(n)
-	// 		if err != nil {
-	// 			return nil, diagnosis, err
-	// 		}
-	// 		nodes = append(nodes, nInfo)
-	// 	}
-	// }
-	// feasibleNodes, err := sched.findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, nodes)
-	// // always try to update the sched.nextStartNodeIndex regardless of whether an error has occurred
-	// // this is helpful to make sure that all the nodes have a chance to be searched
-	// processedNodes := len(feasibleNodes) + len(diagnosis.NodeToStatusMap)
-	// sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(nodes)
-	// if err != nil {
-	// 	return nil, diagnosis, err
-	// }
-	//
-	// feasibleNodes, err = findNodesThatPassExtenders(ctx, sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatusMap)
-	// if err != nil {
-	// 	return nil, diagnosis, err
-	// }
-	var nodes []*v1.Node
-	for _, node := range allNodes {
-		node := node
-		n := node.Node()
-		logger.Info("node", "node", n)
-		if n != nil {
-			nodes = append(nodes, n)
+	// Run "prefilter" plugins.
+	preRes, s := fwk.RunPreFilterPlugins(ctx, state, pod)
+	if !s.IsSuccess() {
+		if !s.IsUnschedulable() {
+			return nil, diagnosis, s.AsError()
+		}
+		// All nodes in NodeToStatusMap will have the same status so that they can be handled in the preemption.
+		// Some non trivial refactoring is needed to avoid this copy.
+		for _, n := range allNodes {
+			diagnosis.NodeToStatusMap[n.Node().Name] = s
+		}
+
+		// Record the messages from PreFilter in Diagnosis.PreFilterMsg.
+		msg := s.Message()
+		diagnosis.PreFilterMsg = msg
+		logger.V(5).Info("Status after running PreFilter plugins for pod", "pod", klog.KObj(pod), "status", msg)
+		// Status satisfying IsUnschedulable() gets injected into diagnosis.UnschedulablePlugins.
+		if s.FailedPlugin() != "" {
+			diagnosis.UnschedulablePlugins.Insert(s.FailedPlugin())
+		}
+		return nil, diagnosis, nil
+	}
+
+	// "NominatedNodeName" can potentially be set in a previous scheduling cycle as a result of preemption.
+	// This node is likely the only candidate that will fit the pod, and hence we try it first before iterating over all nodes.
+	if len(pod.Status.NominatedNodeName) > 0 {
+		feasibleNodes, err := sched.evaluateNominatedNode(ctx, pod, fwk, state, diagnosis)
+		if err != nil {
+			logger.Error(err, "Evaluation failed on nominated node", "pod", klog.KObj(pod), "node", pod.Status.NominatedNodeName)
+		}
+		// Nominated node passes all the filters, scheduler is good to assign this node to the pod.
+		if len(feasibleNodes) != 0 {
+			return feasibleNodes, diagnosis, nil
 		}
 	}
-	return nodes, diagnosis, nil
+
+	nodes := allNodes
+	if !preRes.AllNodes() {
+		nodes = make([]*framework.NodeInfo, 0, len(preRes.NodeNames))
+		for n := range preRes.NodeNames {
+			nInfo, err := sched.nodeInfoSnapshot.NodeInfos().Get(n)
+			if err != nil {
+				return nil, diagnosis, err
+			}
+			nodes = append(nodes, nInfo)
+		}
+	}
+	feasibleNodes, err := sched.findNodesThatPassFilters(ctx, fwk, state, pod, diagnosis, nodes)
+	// always try to update the sched.nextStartNodeIndex regardless of whether an error has occurred
+	// this is helpful to make sure that all the nodes have a chance to be searched
+	processedNodes := len(feasibleNodes) + len(diagnosis.NodeToStatusMap)
+	sched.nextStartNodeIndex = (sched.nextStartNodeIndex + processedNodes) % len(nodes)
+	if err != nil {
+		return nil, diagnosis, err
+	}
+
+	feasibleNodes, err = findNodesThatPassExtenders(ctx, sched.Extenders, pod, feasibleNodes, diagnosis.NodeToStatusMap)
+	if err != nil {
+		return nil, diagnosis, err
+	}
+	return feasibleNodes, diagnosis, nil
 }
 
 func (sched *Scheduler) evaluateNominatedNode(ctx context.Context, pod *v1.Pod, fwk framework.Framework, state *framework.CycleState, diagnosis framework.Diagnosis) ([]*v1.Node, error) {
@@ -875,53 +814,112 @@ var errEmptyPriorityList = errors.New("empty priorityList")
 // in a reservoir sampling manner from the nodes that had the highest score.
 // It also returns the top {count} Nodes,
 // and the top of the list will be always the selected host.
-func selectHost(nodeScoreList []framework.NodePluginScores, count int) (string, []framework.NodePluginScores, error) {
+func selectHost(ctx context.Context, nodeScoreList []framework.NodePluginScores, count int) (string, []framework.NodePluginScores, error) {
+	logger := klog.FromContext(ctx)
 	if len(nodeScoreList) == 0 {
 		return "", nil, errEmptyPriorityList
 	}
 
-	var h nodeScoreHeap = nodeScoreList
-	heap.Init(&h)
-	cntOfMaxScore := 1
-	selectedIndex := 0
-	// The top of the heap is the NodeScoreResult with the highest score.
-	sortedNodeScoreList := make([]framework.NodePluginScores, 0, count)
-	sortedNodeScoreList = append(sortedNodeScoreList, heap.Pop(&h).(framework.NodePluginScores))
+	logger.Info("selectHost")
 
-	// This for-loop will continue until all Nodes with the highest scores get checked for a reservoir sampling,
-	// and sortedNodeScoreList gets (count - 1) elements.
-	for ns := heap.Pop(&h).(framework.NodePluginScores); ; ns = heap.Pop(&h).(framework.NodePluginScores) {
-		if ns.TotalScore != sortedNodeScoreList[0].TotalScore && len(sortedNodeScoreList) == count {
-			break
-		}
-
-		if ns.TotalScore == sortedNodeScoreList[0].TotalScore {
-			cntOfMaxScore++
-			if rand.Intn(cntOfMaxScore) == 0 {
-				// Replace the candidate with probability of 1/cntOfMaxScore
-				selectedIndex = cntOfMaxScore - 1
-			}
-		}
-
-		sortedNodeScoreList = append(sortedNodeScoreList, ns)
-
-		if h.Len() == 0 {
-			break
-		}
+	request := make(map[string]any)
+	request["pod"] = pod
+	request["nodes"] = feasibleNodes
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return result, err
+	}
+	logger.Info("scheduler request", "request", requestJSON)
+	url := "http://localhost:7070/scheduler"
+	logger.Info(url)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestJSON))
+	if err != nil {
+		logger.Info("failed building request")
+		logger.Error(err, "building request")
+		return result, err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+	logger.Info("sending request")
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Info("failed sending request")
+		logger.Error(err, "sending request")
+		return result, err
+	}
+	logger.Info("reading response body")
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Error(err, "reading response")
+		return result, err
 	}
 
-	if selectedIndex != 0 {
-		// replace the first one with selected one
-		previous := sortedNodeScoreList[0]
-		sortedNodeScoreList[0] = sortedNodeScoreList[selectedIndex]
-		sortedNodeScoreList[selectedIndex] = previous
+	if resp.StatusCode != http.StatusOK {
+		logger.Info("failed request", "status", resp.StatusCode, "body", body)
+		return result, errors.New("failed to send request")
 	}
 
-	if len(sortedNodeScoreList) > count {
-		sortedNodeScoreList = sortedNodeScoreList[:count]
+	type Resp struct {
+		NodeName string `json:"node_name"`
 	}
+	logger.Info("parsing response")
+	var res Resp
+	err = json.Unmarshal(body, &res)
+	if err != nil {
+		logger.Info("failed parsing response")
+		return result, err
+	}
+	logger.Info("got response", "response", res)
 
-	return sortedNodeScoreList[0].Name, sortedNodeScoreList, nil
+	return ScheduleResult{
+		SuggestedHost:  res.NodeName,
+		EvaluatedNodes: len(feasibleNodes) + len(diagnosis.NodeToStatusMap),
+		FeasibleNodes:  1,
+	}, nil
+
+	// var h nodeScoreHeap = nodeScoreList
+	// heap.Init(&h)
+	// cntOfMaxScore := 1
+	// selectedIndex := 0
+	// // The top of the heap is the NodeScoreResult with the highest score.
+	// sortedNodeScoreList := make([]framework.NodePluginScores, 0, count)
+	// sortedNodeScoreList = append(sortedNodeScoreList, heap.Pop(&h).(framework.NodePluginScores))
+	//
+	// // This for-loop will continue until all Nodes with the highest scores get checked for a reservoir sampling,
+	// // and sortedNodeScoreList gets (count - 1) elements.
+	// for ns := heap.Pop(&h).(framework.NodePluginScores); ; ns = heap.Pop(&h).(framework.NodePluginScores) {
+	// 	if ns.TotalScore != sortedNodeScoreList[0].TotalScore && len(sortedNodeScoreList) == count {
+	// 		break
+	// 	}
+	//
+	// 	if ns.TotalScore == sortedNodeScoreList[0].TotalScore {
+	// 		cntOfMaxScore++
+	// 		if rand.Intn(cntOfMaxScore) == 0 {
+	// 			// Replace the candidate with probability of 1/cntOfMaxScore
+	// 			selectedIndex = cntOfMaxScore - 1
+	// 		}
+	// 	}
+	//
+	// 	sortedNodeScoreList = append(sortedNodeScoreList, ns)
+	//
+	// 	if h.Len() == 0 {
+	// 		break
+	// 	}
+	// }
+	//
+	// if selectedIndex != 0 {
+	// 	// replace the first one with selected one
+	// 	previous := sortedNodeScoreList[0]
+	// 	sortedNodeScoreList[0] = sortedNodeScoreList[selectedIndex]
+	// 	sortedNodeScoreList[selectedIndex] = previous
+	// }
+	//
+	// if len(sortedNodeScoreList) > count {
+	// 	sortedNodeScoreList = sortedNodeScoreList[:count]
+	// }
+	//
+	// return sortedNodeScoreList[0].Name, sortedNodeScoreList, nil
 }
 
 // nodeScoreHeap is a heap of framework.NodePluginScores.
