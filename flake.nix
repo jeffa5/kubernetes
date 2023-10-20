@@ -12,6 +12,7 @@
   in {
     devShells.${system}.default = pkgs.mkShellNoCC {
       packages = [pkgs.go pkgs.gopls pkgs.etcd];
+      GOPATH="/local/scatch/apj39/go";
     };
   };
 }
