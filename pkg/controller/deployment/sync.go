@@ -30,6 +30,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller"
 	deploymentutil "k8s.io/kubernetes/pkg/controller/deployment/util"
+	"k8s.io/kubernetes/pkg/mco"
 	labelsutil "k8s.io/kubernetes/pkg/util/labels"
 )
 
@@ -47,25 +48,65 @@ func (dc *DeploymentController) syncStatusOnly(ctx context.Context, d *apps.Depl
 // sync is responsible for reconciling deployments on scaling events or when they
 // are paused.
 func (dc *DeploymentController) sync(ctx context.Context, d *apps.Deployment, rsList []*apps.ReplicaSet) error {
-	newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, false)
+	type DeploymentRequest struct {
+		Deployment  *apps.Deployment   `json:"deployment"`
+		Replicasets []*apps.ReplicaSet `json:"replicasets"`
+	}
+	type DeploymentResponse struct {
+		Action     string           `json:"action"`
+		Deployment *apps.Deployment `json:"deployment"`
+		Replicaset *apps.ReplicaSet `json:"replicaset"`
+	}
+
+	var res DeploymentResponse
+	err := mco.Send(ctx, "deployment", DeploymentRequest{Deployment: d, Replicasets: rsList}, &res)
 	if err != nil {
 		return err
 	}
-	if err := dc.scale(ctx, d, newRS, oldRSs); err != nil {
-		// If we get an error while trying to scale, the deployment will be requeued
-		// so we can abort this resync
-		return err
-	}
 
-	// Clean up the deployment when it's paused and no rollback is in flight.
-	if d.Spec.Paused && getRollbackTo(d) == nil {
-		if err := dc.cleanupDeployment(ctx, oldRSs, d); err != nil {
-			return err
+	logger := klog.FromContext(ctx)
+	switch res.Action {
+	case "updateReplicaSet":
+		_, err := dc.client.AppsV1().ReplicaSets(res.Replicaset.ObjectMeta.Namespace).Update(ctx, res.Replicaset, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update replica set")
 		}
+		logger.Info("Updated replica set")
+	case "updateDeploymentStatus":
+		dep, err := dc.client.AppsV1().Deployments(res.Deployment.ObjectMeta.Namespace).UpdateStatus(ctx, res.Deployment, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update deployment")
+		}
+		logger.Info("Updated deployment", "deployment", dep)
+	case "updateDeployment":
+		dep, err := dc.client.AppsV1().Deployments(res.Deployment.ObjectMeta.Namespace).Update(ctx, res.Deployment, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update deployment")
+		}
+		logger.Info("Updated deployment", "deployment", dep)
 	}
 
-	allRSs := append(oldRSs, newRS)
-	return dc.syncDeploymentStatus(ctx, allRSs, newRS, d)
+	return nil
+
+	// newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, false)
+	// if err != nil {
+	// 	return err
+	// }
+	// if err := dc.scale(ctx, d, newRS, oldRSs); err != nil {
+	// 	// If we get an error while trying to scale, the deployment will be requeued
+	// 	// so we can abort this resync
+	// 	return err
+	// }
+	//
+	// // Clean up the deployment when it's paused and no rollback is in flight.
+	// if d.Spec.Paused && getRollbackTo(d) == nil {
+	// 	if err := dc.cleanupDeployment(ctx, oldRSs, d); err != nil {
+	// 		return err
+	// 	}
+	// }
+	//
+	// allRSs := append(oldRSs, newRS)
+	// return dc.syncDeploymentStatus(ctx, allRSs, newRS, d)
 }
 
 // checkPausedConditions checks if the given deployment is paused or not and adds an appropriate condition.
