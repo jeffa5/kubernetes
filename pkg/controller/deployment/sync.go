@@ -53,9 +53,10 @@ func (dc *DeploymentController) sync(ctx context.Context, d *apps.Deployment, rs
 		Replicasets []*apps.ReplicaSet `json:"replicasets"`
 	}
 	type DeploymentResponse struct {
-		Action     string           `json:"action"`
-		Deployment *apps.Deployment `json:"deployment"`
-		Replicaset *apps.ReplicaSet `json:"replicaset"`
+		Action      string             `json:"action"`
+		Deployment  *apps.Deployment   `json:"deployment"`
+		Replicaset  *apps.ReplicaSet   `json:"replicaset"`
+		Replicasets []*apps.ReplicaSet `json:"replicasets"`
 	}
 
 	var res DeploymentResponse
@@ -72,6 +73,14 @@ func (dc *DeploymentController) sync(ctx context.Context, d *apps.Deployment, rs
 			logger.Error(err, "failed to update replica set")
 		}
 		logger.Info("Updated replica set")
+	case "updateReplicaSets":
+		for _, rs := range res.Replicasets {
+			_, err := dc.client.AppsV1().ReplicaSets(rs.ObjectMeta.Namespace).Update(ctx, rs, metav1.UpdateOptions{})
+			if err != nil {
+				logger.Error(err, "failed to update replica set")
+			}
+			logger.Info("Updated replica set")
+		}
 	case "updateDeploymentStatus":
 		dep, err := dc.client.AppsV1().Deployments(res.Deployment.ObjectMeta.Namespace).UpdateStatus(ctx, res.Deployment, metav1.UpdateOptions{})
 		if err != nil {
