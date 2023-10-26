@@ -47,6 +47,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/deployment/util"
+	"k8s.io/kubernetes/pkg/mco"
 )
 
 const (
@@ -540,8 +541,8 @@ func (dc *DeploymentController) getReplicaSetsForDeployment(ctx context.Context,
 		}
 		return fresh, nil
 	})
-	cm := controller.NewReplicaSetControllerRefManager(dc.rsControl, d, deploymentSelector, controllerKind, canAdoptFunc)
-	return cm.ClaimReplicaSets(ctx, rsList)
+	controller.NewReplicaSetControllerRefManager(dc.rsControl, d, deploymentSelector, controllerKind, canAdoptFunc)
+	return rsList, nil
 }
 
 // getPodMapForDeployment returns the Pods managed by a Deployment.
@@ -619,57 +620,125 @@ func (dc *DeploymentController) syncDeployment(ctx context.Context, key string) 
 		return nil
 	}
 
-	// List ReplicaSets owned by this Deployment, while reconciling ControllerRef
+	// List ReplicaSets in this namespace, while reconciling ControllerRef
 	// through adoption/orphaning.
 	rsList, err := dc.getReplicaSetsForDeployment(ctx, d)
 	if err != nil {
 		return err
 	}
+
 	// List all Pods owned by this Deployment, grouped by their ReplicaSet.
 	// Current uses of the podMap are:
 	//
 	// * check if a Pod is labeled correctly with the pod-template-hash label.
 	// * check that no old Pods are running in the middle of Recreate Deployments.
-	podMap, err := dc.getPodMapForDeployment(d, rsList)
+	// podMap, err := dc.getPodMapForDeployment(d, rsList)
+	// if err != nil {
+	// 	return err
+	// }
+
+	// make rsList not be nil, just maybe an empty list
+	if rsList == nil {
+		rsList = []*apps.ReplicaSet{}
+	}
+
+	type DeploymentRequest struct {
+		Deployment  *apps.Deployment   `json:"deployment"`
+		Replicasets []*apps.ReplicaSet `json:"replicasets"`
+	}
+	type DeploymentResponse struct {
+		Action      string             `json:"action"`
+		Deployment  *apps.Deployment   `json:"deployment"`
+		Replicaset  *apps.ReplicaSet   `json:"replicaset"`
+		Replicasets []*apps.ReplicaSet `json:"replicasets"`
+	}
+
+	var res DeploymentResponse
+	err = mco.Send(ctx, "deployment", DeploymentRequest{Deployment: d, Replicasets: rsList}, &res)
 	if err != nil {
 		return err
 	}
 
-	if d.DeletionTimestamp != nil {
-		return dc.syncStatusOnly(ctx, d, rsList)
+	switch res.Action {
+	case "createReplicaSet":
+		_, err := dc.client.AppsV1().ReplicaSets(res.Replicaset.ObjectMeta.Namespace).Create(ctx, res.Replicaset, metav1.CreateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to create replica set")
+			return err
+		}
+		logger.Info("Created replica set")
+	case "updateReplicaSet":
+		_, err := dc.client.AppsV1().ReplicaSets(res.Replicaset.ObjectMeta.Namespace).Update(ctx, res.Replicaset, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update replica set")
+			return err
+		}
+		logger.Info("Updated replica set")
+	case "updateReplicaSets":
+		for _, rs := range res.Replicasets {
+			_, err := dc.client.AppsV1().ReplicaSets(rs.ObjectMeta.Namespace).Update(ctx, rs, metav1.UpdateOptions{})
+			if err != nil {
+				logger.Error(err, "failed to update replica set")
+				return err
+			}
+			logger.Info("Updated replica set")
+		}
+	case "updateDeploymentStatus":
+		dep, err := dc.client.AppsV1().Deployments(res.Deployment.ObjectMeta.Namespace).UpdateStatus(ctx, res.Deployment, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update deployment")
+			return err
+		}
+		logger.Info("Updated deployment", "deployment", dep)
+	case "updateDeployment":
+		dep, err := dc.client.AppsV1().Deployments(res.Deployment.ObjectMeta.Namespace).Update(ctx, res.Deployment, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update deployment")
+			return err
+		}
+		logger.Info("Updated deployment", "deployment", dep)
+	case "requeueDeployment":
+		dc.enqueueRateLimited(res.Deployment)
+		logger.Info("Requeued deployment", "deployment", res.Deployment)
 	}
 
-	// Update deployment conditions with an Unknown condition when pausing/resuming
-	// a deployment. In this way, we can be sure that we won't timeout when a user
-	// resumes a Deployment with a set progressDeadlineSeconds.
-	if err = dc.checkPausedConditions(ctx, d); err != nil {
-		return err
-	}
+	return nil
 
-	if d.Spec.Paused {
-		return dc.sync(ctx, d, rsList)
-	}
-
-	// rollback is not re-entrant in case the underlying replica sets are updated with a new
-	// revision so we should ensure that we won't proceed to update replica sets until we
-	// make sure that the deployment has cleaned up its rollback spec in subsequent enqueues.
-	if getRollbackTo(d) != nil {
-		return dc.rollback(ctx, d, rsList)
-	}
-
-	scalingEvent, err := dc.isScalingEvent(ctx, d, rsList)
-	if err != nil {
-		return err
-	}
-	if scalingEvent {
-		return dc.sync(ctx, d, rsList)
-	}
-
-	switch d.Spec.Strategy.Type {
-	case apps.RecreateDeploymentStrategyType:
-		return dc.rolloutRecreate(ctx, d, rsList, podMap)
-	case apps.RollingUpdateDeploymentStrategyType:
-		return dc.rolloutRolling(ctx, d, rsList)
-	}
-	return fmt.Errorf("unexpected deployment strategy type: %s", d.Spec.Strategy.Type)
+	// if d.DeletionTimestamp != nil {
+	// 	return dc.syncStatusOnly(ctx, d, rsList)
+	// }
+	//
+	// // Update deployment conditions with an Unknown condition when pausing/resuming
+	// // a deployment. In this way, we can be sure that we won't timeout when a user
+	// // resumes a Deployment with a set progressDeadlineSeconds.
+	// if err = dc.checkPausedConditions(ctx, d); err != nil {
+	// 	return err
+	// }
+	//
+	// if d.Spec.Paused {
+	// 	return dc.sync(ctx, d, rsList)
+	// }
+	//
+	// // rollback is not re-entrant in case the underlying replica sets are updated with a new
+	// // revision so we should ensure that we won't proceed to update replica sets until we
+	// // make sure that the deployment has cleaned up its rollback spec in subsequent enqueues.
+	// if getRollbackTo(d) != nil {
+	// 	return dc.rollback(ctx, d, rsList)
+	// }
+	//
+	// scalingEvent, err := dc.isScalingEvent(ctx, d, rsList)
+	// if err != nil {
+	// 	return err
+	// }
+	// if scalingEvent {
+	// 	return dc.sync(ctx, d, rsList)
+	// }
+	//
+	// switch d.Spec.Strategy.Type {
+	// case apps.RecreateDeploymentStrategyType:
+	// 	return dc.rolloutRecreate(ctx, d, rsList, podMap)
+	// case apps.RollingUpdateDeploymentStrategyType:
+	// 	return dc.rolloutRolling(ctx, d, rsList)
+	// }
+	// return fmt.Errorf("unexpected deployment strategy type: %s", d.Spec.Strategy.Type)
 }
