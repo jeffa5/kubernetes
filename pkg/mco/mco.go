@@ -24,13 +24,13 @@ func Send(ctx context.Context, controller string, request interface{}, result in
 
 	requestJSON, err := json.Marshal(request)
 	if err != nil {
+		logger.Error(err, "failed marshalling request")
 		return err
 	}
 	url := url(controller)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestJSON))
 	if err != nil {
-		logger.Info("failed building request")
-		logger.Error(err, "building request")
+		logger.Error(err, "failed building request")
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
@@ -38,8 +38,7 @@ func Send(ctx context.Context, controller string, request interface{}, result in
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		logger.Info("failed sending request")
-		logger.Error(err, "sending request")
+		logger.Error(err, "failed sending request")
 		return err
 	}
 	defer resp.Body.Close()
@@ -51,19 +50,20 @@ func Send(ctx context.Context, controller string, request interface{}, result in
 	}
 
 	if resp.StatusCode >= 300 {
-		logger.Info("failed request", "status", resp.StatusCode, "body", body)
-		return errors.New("failed to send request")
+		err := errors.New("failed to send request")
+		logger.Error(err, "failed request", "status", resp.StatusCode, "body", body)
+		return err
 	}
 
 	if resp.StatusCode != http.StatusNoContent {
 		err = json.Unmarshal(body, result)
 		if err != nil {
-			logger.Error(err, "failed parsing response")
+			logger.Error(err, "failed parsing response", "body", body)
 			return err
 		}
 	}
 
-	logger.Info("got response", "body_raw", body, "body", result)
+	logger.Info("got response", "body", result)
 
 	return nil
 }
