@@ -17,15 +17,11 @@ limitations under the License.
 package scheduler
 
 import (
-	"bytes"
 	"container/heap"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand"
-	"net/http"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -391,7 +387,6 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, err
 	}
 	trace.Step("Snapshotting scheduler cache and node infos done")
-	logger := klog.FromContext(ctx)
 
 	if sched.nodeInfoSnapshot.NumNodes() == 0 {
 		return result, ErrNoNodesAvailable
@@ -402,10 +397,6 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, err
 	}
 	trace.Step("Computing predicates done")
-
-	for _, node := range feasibleNodes {
-		logger.Info("feasiblenode", "name", node.Name)
-	}
 
 	if len(feasibleNodes) == 0 {
 		return result, &framework.FitError{
@@ -429,7 +420,7 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 		return result, err
 	}
 
-	host, _, err := selectHost(ctx, priorityList, numberOfHighestScoredNodesToReport)
+	host, _, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
 	trace.Step("Prioritizing done")
 
 	return ScheduleResult{
@@ -814,112 +805,53 @@ var errEmptyPriorityList = errors.New("empty priorityList")
 // in a reservoir sampling manner from the nodes that had the highest score.
 // It also returns the top {count} Nodes,
 // and the top of the list will be always the selected host.
-func selectHost(ctx context.Context, nodeScoreList []framework.NodePluginScores, count int) (string, []framework.NodePluginScores, error) {
-	logger := klog.FromContext(ctx)
+func selectHost(nodeScoreList []framework.NodePluginScores, count int) (string, []framework.NodePluginScores, error) {
 	if len(nodeScoreList) == 0 {
 		return "", nil, errEmptyPriorityList
 	}
 
-	logger.Info("selectHost")
+	var h nodeScoreHeap = nodeScoreList
+	heap.Init(&h)
+	cntOfMaxScore := 1
+	selectedIndex := 0
+	// The top of the heap is the NodeScoreResult with the highest score.
+	sortedNodeScoreList := make([]framework.NodePluginScores, 0, count)
+	sortedNodeScoreList = append(sortedNodeScoreList, heap.Pop(&h).(framework.NodePluginScores))
 
-	request := make(map[string]any)
-	request["pod"] = pod
-	request["nodes"] = feasibleNodes
-	requestJSON, err := json.Marshal(request)
-	if err != nil {
-		return result, err
-	}
-	logger.Info("scheduler request", "request", requestJSON)
-	url := "http://localhost:7070/scheduler"
-	logger.Info(url)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestJSON))
-	if err != nil {
-		logger.Info("failed building request")
-		logger.Error(err, "building request")
-		return result, err
-	}
-	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
-	logger.Info("sending request")
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		logger.Info("failed sending request")
-		logger.Error(err, "sending request")
-		return result, err
-	}
-	logger.Info("reading response body")
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.Error(err, "reading response")
-		return result, err
+	// This for-loop will continue until all Nodes with the highest scores get checked for a reservoir sampling,
+	// and sortedNodeScoreList gets (count - 1) elements.
+	for ns := heap.Pop(&h).(framework.NodePluginScores); ; ns = heap.Pop(&h).(framework.NodePluginScores) {
+		if ns.TotalScore != sortedNodeScoreList[0].TotalScore && len(sortedNodeScoreList) == count {
+			break
+		}
+
+		if ns.TotalScore == sortedNodeScoreList[0].TotalScore {
+			cntOfMaxScore++
+			if rand.Intn(cntOfMaxScore) == 0 {
+				// Replace the candidate with probability of 1/cntOfMaxScore
+				selectedIndex = cntOfMaxScore - 1
+			}
+		}
+
+		sortedNodeScoreList = append(sortedNodeScoreList, ns)
+
+		if h.Len() == 0 {
+			break
+		}
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		logger.Info("failed request", "status", resp.StatusCode, "body", body)
-		return result, errors.New("failed to send request")
+	if selectedIndex != 0 {
+		// replace the first one with selected one
+		previous := sortedNodeScoreList[0]
+		sortedNodeScoreList[0] = sortedNodeScoreList[selectedIndex]
+		sortedNodeScoreList[selectedIndex] = previous
 	}
 
-	type Resp struct {
-		NodeName string `json:"node_name"`
+	if len(sortedNodeScoreList) > count {
+		sortedNodeScoreList = sortedNodeScoreList[:count]
 	}
-	logger.Info("parsing response")
-	var res Resp
-	err = json.Unmarshal(body, &res)
-	if err != nil {
-		logger.Info("failed parsing response")
-		return result, err
-	}
-	logger.Info("got response", "response", res)
 
-	return ScheduleResult{
-		SuggestedHost:  res.NodeName,
-		EvaluatedNodes: len(feasibleNodes) + len(diagnosis.NodeToStatusMap),
-		FeasibleNodes:  1,
-	}, nil
-
-	// var h nodeScoreHeap = nodeScoreList
-	// heap.Init(&h)
-	// cntOfMaxScore := 1
-	// selectedIndex := 0
-	// // The top of the heap is the NodeScoreResult with the highest score.
-	// sortedNodeScoreList := make([]framework.NodePluginScores, 0, count)
-	// sortedNodeScoreList = append(sortedNodeScoreList, heap.Pop(&h).(framework.NodePluginScores))
-	//
-	// // This for-loop will continue until all Nodes with the highest scores get checked for a reservoir sampling,
-	// // and sortedNodeScoreList gets (count - 1) elements.
-	// for ns := heap.Pop(&h).(framework.NodePluginScores); ; ns = heap.Pop(&h).(framework.NodePluginScores) {
-	// 	if ns.TotalScore != sortedNodeScoreList[0].TotalScore && len(sortedNodeScoreList) == count {
-	// 		break
-	// 	}
-	//
-	// 	if ns.TotalScore == sortedNodeScoreList[0].TotalScore {
-	// 		cntOfMaxScore++
-	// 		if rand.Intn(cntOfMaxScore) == 0 {
-	// 			// Replace the candidate with probability of 1/cntOfMaxScore
-	// 			selectedIndex = cntOfMaxScore - 1
-	// 		}
-	// 	}
-	//
-	// 	sortedNodeScoreList = append(sortedNodeScoreList, ns)
-	//
-	// 	if h.Len() == 0 {
-	// 		break
-	// 	}
-	// }
-	//
-	// if selectedIndex != 0 {
-	// 	// replace the first one with selected one
-	// 	previous := sortedNodeScoreList[0]
-	// 	sortedNodeScoreList[0] = sortedNodeScoreList[selectedIndex]
-	// 	sortedNodeScoreList[selectedIndex] = previous
-	// }
-	//
-	// if len(sortedNodeScoreList) > count {
-	// 	sortedNodeScoreList = sortedNodeScoreList[:count]
-	// }
-	//
-	// return sortedNodeScoreList[0].Name, sortedNodeScoreList, nil
+	return sortedNodeScoreList[0].Name, sortedNodeScoreList, nil
 }
 
 // nodeScoreHeap is a heap of framework.NodePluginScores.
