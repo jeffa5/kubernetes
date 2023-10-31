@@ -60,6 +60,7 @@ import (
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/replicaset/metrics"
+	"k8s.io/kubernetes/pkg/mco"
 	"k8s.io/utils/integer"
 )
 
@@ -690,13 +691,6 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 		return err
 	}
 
-	rsNeedsSync := rsc.expectations.SatisfiedExpectations(logger, key)
-	selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("error converting pod selector to selector for rs %v/%v: %v", namespace, name, err))
-		return nil
-	}
-
 	// list all pods to include the pods that don't match the rs`s selector
 	// anymore but has the stale controller ref.
 	// TODO: Do the List and Filter in a single pass, or use an index.
@@ -704,37 +698,93 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 	if err != nil {
 		return err
 	}
-	// Ignore inactive pods.
-	filteredPods := controller.FilterActivePods(logger, allPods)
+	if len(allPods) == 0 {
+		allPods = []*v1.Pod{}
+	}
 
-	// NOTE: filteredPods are pointing to objects from cache - if you need to
-	// modify them, you need to copy it first.
-	filteredPods, err = rsc.claimPods(ctx, rs, selector, filteredPods)
+	type ReplicasetRequest struct {
+		Replicaset  *apps.ReplicaSet   `json:"replicaset"`
+		Replicasets []*apps.ReplicaSet `json:"replicasets"`
+		Pods        []*v1.Pod          `json:"pods"`
+	}
+	type ReplicasetResponse struct {
+		Action     string           `json:"action"`
+		Replicaset *apps.ReplicaSet `json:"replicaset"`
+		Pod        *v1.Pod          `json:"pod"`
+	}
+
+	var res ReplicasetResponse
+	err = mco.Send(ctx, "replicaset", ReplicasetRequest{Replicaset: rs, Replicasets: []*apps.ReplicaSet{}, Pods: allPods}, &res)
 	if err != nil {
 		return err
 	}
 
-	var manageReplicasErr error
-	if rsNeedsSync && rs.DeletionTimestamp == nil {
-		manageReplicasErr = rsc.manageReplicas(ctx, filteredPods, rs)
+	switch res.Action {
+	case "updatePod":
+		_, err := rsc.kubeClient.CoreV1().Pods(res.Pod.ObjectMeta.Namespace).Update(ctx, res.Pod, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update pod")
+			return err
+		}
+		logger.Info("Updated pod")
+	case "createPod":
+		_, err := rsc.kubeClient.CoreV1().Pods(res.Pod.ObjectMeta.Namespace).Create(ctx, res.Pod, metav1.CreateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to create pod")
+			return err
+		}
+		logger.Info("Created pod")
+	case "deletePod":
+		err := rsc.kubeClient.CoreV1().Pods(res.Pod.ObjectMeta.Namespace).Delete(ctx, res.Pod.ObjectMeta.Name, metav1.DeleteOptions{})
+		if err != nil {
+			logger.Error(err, "failed to delete pod")
+			return err
+		}
+		logger.Info("Deleted pod")
+	case "updateReplicaSetStatus":
+		_, err := rsc.kubeClient.AppsV1().ReplicaSets(res.Replicaset.ObjectMeta.Namespace).UpdateStatus(ctx, res.Replicaset, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update replicaset status")
+			return err
+		}
+		logger.Info("Updated replicaset status")
+	default:
+		panic(fmt.Sprintf("got unmatched action: %v\n", res.Action))
 	}
-	rs = rs.DeepCopy()
-	newStatus := calculateStatus(rs, filteredPods, manageReplicasErr)
 
-	// Always updates status as pods come up or die.
-	updatedRS, err := updateReplicaSetStatus(logger, rsc.kubeClient.AppsV1().ReplicaSets(rs.Namespace), rs, newStatus)
-	if err != nil {
-		// Multiple things could lead to this update failing. Requeuing the replica set ensures
-		// Returning an error causes a requeue without forcing a hotloop
-		return err
-	}
-	// Resync the ReplicaSet after MinReadySeconds as a last line of defense to guard against clock-skew.
-	if manageReplicasErr == nil && updatedRS.Spec.MinReadySeconds > 0 &&
-		updatedRS.Status.ReadyReplicas == *(updatedRS.Spec.Replicas) &&
-		updatedRS.Status.AvailableReplicas != *(updatedRS.Spec.Replicas) {
-		rsc.queue.AddAfter(key, time.Duration(updatedRS.Spec.MinReadySeconds)*time.Second)
-	}
-	return manageReplicasErr
+	return nil
+
+	// // Ignore inactive pods.
+	// filteredPods := controller.FilterActivePods(logger, allPods)
+	//
+	// // NOTE: filteredPods are pointing to objects from cache - if you need to
+	// // modify them, you need to copy it first.
+	// filteredPods, err = rsc.claimPods(ctx, rs, selector, filteredPods)
+	// if err != nil {
+	// 	return err
+	// }
+	//
+	// var manageReplicasErr error
+	// if rsNeedsSync && rs.DeletionTimestamp == nil {
+	// 	manageReplicasErr = rsc.manageReplicas(ctx, filteredPods, rs)
+	// }
+	// rs = rs.DeepCopy()
+	// newStatus := calculateStatus(rs, filteredPods, manageReplicasErr)
+	//
+	// // Always updates status as pods come up or die.
+	// updatedRS, err := updateReplicaSetStatus(logger, rsc.kubeClient.AppsV1().ReplicaSets(rs.Namespace), rs, newStatus)
+	// if err != nil {
+	// 	// Multiple things could lead to this update failing. Requeuing the replica set ensures
+	// 	// Returning an error causes a requeue without forcing a hotloop
+	// 	return err
+	// }
+	// // Resync the ReplicaSet after MinReadySeconds as a last line of defense to guard against clock-skew.
+	// if manageReplicasErr == nil && updatedRS.Spec.MinReadySeconds > 0 &&
+	// 	updatedRS.Status.ReadyReplicas == *(updatedRS.Spec.Replicas) &&
+	// 	updatedRS.Status.AvailableReplicas != *(updatedRS.Spec.Replicas) {
+	// 	rsc.queue.AddAfter(key, time.Duration(updatedRS.Spec.MinReadySeconds)*time.Second)
+	// }
+	// return manageReplicasErr
 }
 
 func (rsc *ReplicaSetController) claimPods(ctx context.Context, rs *apps.ReplicaSet, selector labels.Selector, filteredPods []*v1.Pod) ([]*v1.Pod, error) {

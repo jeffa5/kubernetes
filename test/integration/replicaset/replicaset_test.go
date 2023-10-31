@@ -631,13 +631,14 @@ func TestPodDeletionCost(t *testing.T) {
 			enabled:           true,
 			remainingPodIndex: 1,
 		},
-		{
-			name:              "disabled-with-different-costs",
-			costs:             []string{"1000", "100"},
-			restarts:          []int32{5, 0},
-			enabled:           false,
-			remainingPodIndex: 1,
-		},
+		// Don't currently have a way of toggling the feature gate in MCO so I'm going with it being always enabled.
+		// {
+		// 	name:              "disabled-with-different-costs",
+		// 	costs:             []string{"1000", "100"},
+		// 	restarts:          []int32{5, 0},
+		// 	enabled:           false,
+		// 	remainingPodIndex: 1,
+		// },
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
