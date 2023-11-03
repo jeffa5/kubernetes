@@ -42,6 +42,7 @@ import (
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/history"
+	"k8s.io/kubernetes/pkg/mco"
 
 	"k8s.io/klog/v2"
 )
@@ -463,23 +464,134 @@ func (ssc *StatefulSetController) sync(ctx context.Context, key string) error {
 		return err
 	}
 
-	selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
+	// selector, err := metav1.LabelSelectorAsSelector(set.Spec.Selector)
+	// if err != nil {
+	// 	utilruntime.HandleError(fmt.Errorf("error converting StatefulSet %v selector: %v", key, err))
+	// 	// This is a non-transient error, so don't retry.
+	// 	return nil
+	// }
+
+	// if err := ssc.adoptOrphanRevisions(ctx, set); err != nil {
+	// 	return err
+	// }
+
+	pods, err := ssc.podLister.Pods(set.Namespace).List(labels.Everything())
+	// pods, err := ssc.getPodsForStatefulSet(ctx, set, selector)
 	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("error converting StatefulSet %v selector: %v", key, err))
-		// This is a non-transient error, so don't retry.
-		return nil
+		return err
+	}
+	if len(pods) == 0 {
+		pods = []*v1.Pod{}
 	}
 
-	if err := ssc.adoptOrphanRevisions(ctx, set); err != nil {
+	controllerRevisionsList, err := ssc.kubeClient.AppsV1().ControllerRevisions(set.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	controllerRevisions := controllerRevisionsList.Items
+	if len(controllerRevisions) == 0 {
+		controllerRevisions = []apps.ControllerRevision{}
+	}
+
+	pvcsList, err := ssc.kubeClient.CoreV1().PersistentVolumeClaims(set.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	pvcs := pvcsList.Items
+	if len(pvcs) == 0 {
+		pvcs = []v1.PersistentVolumeClaim{}
+	}
+
+	// return ssc.syncStatefulSet(ctx, set, pods)
+
+	type StatefulSetRequest struct {
+		StatefulSet            *apps.StatefulSet          `json:"statefulset"`
+		Pods                   []*v1.Pod                  `json:"pods"`
+		ControllerRevisions    []apps.ControllerRevision  `json:"controllerRevisions"`
+		PersistentVolumeClaims []v1.PersistentVolumeClaim `json:"persistentVolumeClaims"`
+	}
+	type StatefulSetResponse struct {
+		Action                string                    `json:"action"`
+		StatefulSet           *apps.StatefulSet         `json:"statefulset"`
+		Pod                   *v1.Pod                   `json:"pod"`
+		ControllerRevision    *apps.ControllerRevision  `json:"controllerRevision"`
+		PersistentVolumeClaim *v1.PersistentVolumeClaim `json:"persistentVolumeClaim"`
+	}
+
+	var res StatefulSetResponse
+	err = mco.Send(ctx, "statefulset", StatefulSetRequest{
+		StatefulSet:            set,
+		Pods:                   pods,
+		ControllerRevisions:    controllerRevisions,
+		PersistentVolumeClaims: pvcs,
+	}, &res)
+	if err != nil {
 		return err
 	}
 
-	pods, err := ssc.getPodsForStatefulSet(ctx, set, selector)
-	if err != nil {
-		return err
+	switch res.Action {
+	case "updateStatefulSetStatus":
+		_, err := ssc.kubeClient.AppsV1().StatefulSets(res.StatefulSet.ObjectMeta.Namespace).UpdateStatus(ctx, res.StatefulSet, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update statefulset status")
+			return err
+		}
+		logger.Info("Updated statefulset status")
+	case "createPod":
+		_, err := ssc.kubeClient.CoreV1().Pods(res.Pod.ObjectMeta.Namespace).Create(ctx, res.Pod, metav1.CreateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to create pod")
+			return err
+		}
+		logger.Info("Created pod")
+		ssc.enqueueStatefulSet(set)
+	case "updatePod":
+		_, err := ssc.kubeClient.CoreV1().Pods(res.Pod.ObjectMeta.Namespace).Update(ctx, res.Pod, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update pod")
+			return err
+		}
+		logger.Info("Updated pod")
+		ssc.enqueueStatefulSet(set)
+	case "deletePod":
+		err := ssc.kubeClient.CoreV1().Pods(res.Pod.ObjectMeta.Namespace).Delete(ctx, res.Pod.ObjectMeta.Name, metav1.DeleteOptions{})
+		if err != nil {
+			logger.Error(err, "failed to delete pod")
+			return err
+		}
+		logger.Info("Deleted pod")
+		ssc.enqueueStatefulSet(set)
+	case "createControllerRevision":
+		_, err := ssc.kubeClient.AppsV1().ControllerRevisions(res.ControllerRevision.ObjectMeta.Namespace).Create(ctx, res.ControllerRevision, metav1.CreateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to create controller revision")
+			return err
+		}
+		logger.Info("Created controller revision")
+		ssc.enqueueStatefulSet(set)
+	case "updateControllerRevision":
+		_, err := ssc.kubeClient.AppsV1().ControllerRevisions(res.ControllerRevision.ObjectMeta.Namespace).Update(ctx, res.ControllerRevision, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update controller revision")
+			return err
+		}
+		logger.Info("Updated controller revision")
+		ssc.enqueueStatefulSet(set)
+	case "createPersistentVolumeClaim":
+		_, err := ssc.kubeClient.CoreV1().PersistentVolumeClaims(res.PersistentVolumeClaim.ObjectMeta.Namespace).Create(ctx, res.PersistentVolumeClaim, metav1.CreateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to create persistient volume claim")
+			return err
+		}
+		logger.Info("Create persistent volume claim")
+		ssc.enqueueStatefulSet(set)
+	case "":
+		// no action
+	default:
+		panic(fmt.Sprintf("got unmatched action: %v\n", res.Action))
 	}
 
-	return ssc.syncStatefulSet(ctx, set, pods)
+	return nil
 }
 
 // syncStatefulSet syncs a tuple of (statefulset, []*v1.Pod).
