@@ -132,3 +132,5 @@ vendordiff.patch
 .direnv
 
 tests.txt
+
+*.out
