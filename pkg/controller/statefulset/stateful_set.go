@@ -585,6 +585,14 @@ func (ssc *StatefulSetController) sync(ctx context.Context, key string) error {
 		}
 		logger.Info("Create persistent volume claim")
 		ssc.enqueueStatefulSet(set)
+	case "updatePersistentVolumeClaim":
+		_, err := ssc.kubeClient.CoreV1().PersistentVolumeClaims(res.PersistentVolumeClaim.ObjectMeta.Namespace).Update(ctx, res.PersistentVolumeClaim, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update persistient volume claim")
+			return err
+		}
+		logger.Info("Update persistent volume claim")
+		ssc.enqueueStatefulSet(set)
 	case "":
 		// no action
 	default:
