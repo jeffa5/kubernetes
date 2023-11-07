@@ -302,6 +302,23 @@ func getStatefulSetPVCs(t *testing.T, pvcClient typedv1.PersistentVolumeClaimInt
 	return pvcs
 }
 
+func waitStatefulSetPVCs(t *testing.T, pvcClient typedv1.PersistentVolumeClaimInterface, sts *appsv1.StatefulSet) {
+	if err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
+		pvcs := []*v1.PersistentVolumeClaim{}
+		for i := int32(0); i < *sts.Spec.Replicas; i++ {
+			pvcName := fmt.Sprintf("%s-%s-%d", sts.Spec.VolumeClaimTemplates[0].Name, sts.Name, i)
+			pvc, err := pvcClient.Get(context.TODO(), pvcName, metav1.GetOptions{})
+			if err != nil {
+				return false, nil
+			}
+			pvcs = append(pvcs, pvc)
+		}
+		return len(pvcs) == int(*sts.Spec.Replicas), nil
+	}); err != nil {
+		t.Fatalf("failed to wait for statefulset pvc creation, sts %s: %v", sts.Name, err)
+	}
+}
+
 func verifyOwnerRef(t *testing.T, pvc *v1.PersistentVolumeClaim, kind string, expected bool) {
 	found := false
 	for _, ref := range pvc.GetOwnerReferences() {

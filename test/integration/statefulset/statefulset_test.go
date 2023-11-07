@@ -463,8 +463,13 @@ func TestAutodeleteOwnerRefs(t *testing.T) {
 			sts = stss[0]
 			waitSTSStable(t, c, sts)
 
-			// Verify StatefulSet ownerref has been added as appropriate.
 			pvcClient := c.CoreV1().PersistentVolumeClaims(ns.Name)
+
+			// Wait for PVCs rather than relying on stable STS to indicate everything is created.
+			t.Log("Waiting for statefulset pvcs to be created")
+			waitStatefulSetPVCs(t, pvcClient, sts)
+
+			// Verify StatefulSet ownerref has been added as appropriate.
 			pvcs := getStatefulSetPVCs(t, pvcClient, sts)
 			for _, pvc := range pvcs {
 				verifyOwnerRef(t, pvc, "StatefulSet", test.expectSetOwnerRef)
