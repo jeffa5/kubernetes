@@ -37,6 +37,7 @@ import (
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
+	"k8s.io/kubernetes/pkg/mco"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	internalqueue "k8s.io/kubernetes/pkg/scheduler/internal/queue"
@@ -398,36 +399,99 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 	}
 	trace.Step("Computing predicates done")
 
-	if len(feasibleNodes) == 0 {
-		return result, &framework.FitError{
-			Pod:         pod,
-			NumAllNodes: sched.nodeInfoSnapshot.NumNodes(),
-			Diagnosis:   diagnosis,
+	logger := klog.FromContext(ctx)
+
+	allNodeInfos, err := sched.nodeInfoSnapshot.NodeInfos().List()
+	if err != nil {
+		return result, err
+	}
+	allNodes := []*v1.Node{}
+	for _, ni := range allNodeInfos {
+		allNodes = append(allNodes, ni.Node())
+	}
+
+	boundPods := []*v1.Pod{}
+	for _, ni := range allNodeInfos {
+		for _, pod := range ni.Pods {
+			boundPods = append(boundPods, pod.Pod)
 		}
 	}
 
-	// When only one node after predicate, just use it.
-	if len(feasibleNodes) == 1 {
-		return ScheduleResult{
-			SuggestedHost:  feasibleNodes[0].Name,
-			EvaluatedNodes: 1 + len(diagnosis.NodeToStatusMap),
-			FeasibleNodes:  1,
-		}, nil
+	pvcsList, err := sched.client.CoreV1().PersistentVolumeClaims(pod.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return result, err
+	}
+	pvcs := pvcsList.Items
+	if len(pvcs) == 0 {
+		pvcs = []v1.PersistentVolumeClaim{}
 	}
 
-	priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, feasibleNodes)
+	type SchedulerRequest struct {
+		Pod                    *v1.Pod                    `json:"pod"`
+		BoundPods              []*v1.Pod                  `json:"boundPods"`
+		Nodes                  []*v1.Node                 `json:"nodes"`
+		PersistentVolumeClaims []v1.PersistentVolumeClaim `json:"persistentVolumeClaims"`
+	}
+	type SchedulerResponse struct {
+		Action   string `json:"action"`
+		NodeName string `json:"nodeName"`
+	}
+
+	var res SchedulerResponse
+	err = mco.Send(ctx, "scheduler", SchedulerRequest{Pod: pod, BoundPods: boundPods, Nodes: allNodes, PersistentVolumeClaims: pvcs}, &res)
 	if err != nil {
 		return result, err
 	}
 
-	host, _, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
-	trace.Step("Prioritizing done")
+	switch res.Action {
+	case "schedulePod":
+		logger.Info("Scheduled node", "pod", pod.Name, "node", res.NodeName)
+		return ScheduleResult{
+			SuggestedHost:  res.NodeName,
+			EvaluatedNodes: 1 + len(diagnosis.NodeToStatusMap),
+			FeasibleNodes:  len(feasibleNodes),
+		}, nil
+	case "":
+		logger.Info("Got no action")
+		return result, &framework.FitError{
+			Pod: pod,
+			// NumAllNodes: sched.nodeInfoSnapshot.NumNodes(),
+			// Diagnosis:   diagnosis,
+		}
+	default:
+		panic(fmt.Sprintf("got unmatched action: %v\n", res.Action))
+	}
 
-	return ScheduleResult{
-		SuggestedHost:  host,
-		EvaluatedNodes: len(feasibleNodes) + len(diagnosis.NodeToStatusMap),
-		FeasibleNodes:  len(feasibleNodes),
-	}, err
+	// if len(feasibleNodes) == 0 {
+	// 	return result, &framework.FitError{
+	// 		Pod:         pod,
+	// 		NumAllNodes: sched.nodeInfoSnapshot.NumNodes(),
+	// 		Diagnosis:   diagnosis,
+	// 	}
+	// }
+	//
+	// // When only one node after predicate, just use it.
+	// if len(feasibleNodes) == 1 {
+	// 	return ScheduleResult{
+	// 		SuggestedHost:  feasibleNodes[0].Name,
+	// 		EvaluatedNodes: 1 + len(diagnosis.NodeToStatusMap),
+	// 		FeasibleNodes:  1,
+	// 	}, nil
+	// }
+	//
+	// priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, feasibleNodes)
+	// if err != nil {
+	// 	return result, err
+	// }
+	//
+	// host, _, err := selectHost(priorityList, numberOfHighestScoredNodesToReport)
+	// trace.Step("Prioritizing done")
+	//
+	// return ScheduleResult{
+	// 	SuggestedHost:  host,
+	// 	EvaluatedNodes: len(feasibleNodes) + len(diagnosis.NodeToStatusMap),
+	// 	FeasibleNodes:  len(feasibleNodes),
+	// }, err
 }
 
 // Filters the nodes to find the ones that fit the pod based on the framework
