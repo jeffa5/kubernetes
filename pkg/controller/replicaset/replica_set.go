@@ -748,6 +748,8 @@ func (rsc *ReplicaSetController) syncReplicaSet(ctx context.Context, key string)
 			return err
 		}
 		logger.Info("Updated replicaset status")
+	case "":
+		logger.Info("Got no action")
 	default:
 		panic(fmt.Sprintf("got unmatched action: %v\n", res.Action))
 	}
