@@ -51,6 +51,7 @@ import (
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/job/metrics"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/mco"
 	"k8s.io/utils/clock"
 	"k8s.io/utils/integer"
 	"k8s.io/utils/ptr"
@@ -775,160 +776,211 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 	// Check the expectations of the job before counting active pods, otherwise a new pod can sneak in
 	// and update the expectations after we've retrieved active pods from the store. If a new pod enters
 	// the store after we've checked the expectation, the job sync is just deferred till the next relist.
-	satisfiedExpectations := jm.expectations.SatisfiedExpectations(logger, key)
+	// satisfiedExpectations := jm.expectations.SatisfiedExpectations(logger, key)
 
 	pods, err := jm.getPodsForJob(ctx, &job)
 	if err != nil {
 		return err
 	}
-	var terminating *int32
-	if feature.DefaultFeatureGate.Enabled(features.JobPodReplacementPolicy) {
-		terminating = ptr.To(controller.CountTerminatingPods(pods))
-	}
-	jobCtx := &syncJobCtx{
-		job:                  &job,
-		pods:                 pods,
-		activePods:           controller.FilterActivePods(logger, pods),
-		terminating:          terminating,
-		uncounted:            newUncountedTerminatedPods(*job.Status.UncountedTerminatedPods),
-		expectedRmFinalizers: jm.finalizerExpectations.getExpectedUIDs(key),
-	}
-	active := int32(len(jobCtx.activePods))
-	newSucceededPods, newFailedPods := getNewFinishedPods(jobCtx)
-	jobCtx.succeeded = job.Status.Succeeded + int32(len(newSucceededPods)) + int32(len(jobCtx.uncounted.succeeded))
-	failed := job.Status.Failed + int32(nonIgnoredFailedPodsCount(jobCtx, newFailedPods)) + int32(len(jobCtx.uncounted.failed))
-	var ready *int32
-	if feature.DefaultFeatureGate.Enabled(features.JobReadyPods) {
-		ready = ptr.To(countReadyPods(jobCtx.activePods))
+
+	if len(pods) == 0 {
+		pods = []*v1.Pod{}
 	}
 
-	// Job first start. Set StartTime only if the job is not in the suspended state.
-	if job.Status.StartTime == nil && !jobSuspended(&job) {
-		now := metav1.NewTime(jm.clock.Now())
-		job.Status.StartTime = &now
+	type JobRequest struct {
+		Job  batch.Job `json:"job"`
+		Pods []*v1.Pod `json:"pods"`
+	}
+	type JobResponse struct {
+		Action string     `json:"action"`
+		Job    *batch.Job `json:"job"`
+		Pod    *v1.Pod    `json:"pod"`
 	}
 
-	jobCtx.newBackoffRecord = jm.podBackoffStore.newBackoffRecord(key, newSucceededPods, newFailedPods)
-
-	var manageJobErr error
-
-	exceedsBackoffLimit := failed > *job.Spec.BackoffLimit
-
-	if feature.DefaultFeatureGate.Enabled(features.JobPodFailurePolicy) {
-		if failureTargetCondition := findConditionByType(job.Status.Conditions, batch.JobFailureTarget); failureTargetCondition != nil {
-			jobCtx.finishedCondition = newFailedConditionForFailureTarget(failureTargetCondition, jm.clock.Now())
-		} else if failJobMessage := getFailJobMessage(&job, pods); failJobMessage != nil {
-			// Prepare the interim FailureTarget condition to record the failure message before the finalizers (allowing removal of the pods) are removed.
-			jobCtx.finishedCondition = newCondition(batch.JobFailureTarget, v1.ConditionTrue, batch.JobReasonPodFailurePolicy, *failJobMessage, jm.clock.Now())
-		}
-	}
-	if jobCtx.finishedCondition == nil {
-		if exceedsBackoffLimit || pastBackoffLimitOnFailure(&job, pods) {
-			// check if the number of pod restart exceeds backoff (for restart OnFailure only)
-			// OR if the number of failed jobs increased since the last syncJob
-			jobCtx.finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, batch.JobReasonBackoffLimitExceeded, "Job has reached the specified backoff limit", jm.clock.Now())
-		} else if jm.pastActiveDeadline(&job) {
-			jobCtx.finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, batch.JobReasonDeadlineExceeded, "Job was active longer than specified deadline", jm.clock.Now())
-		} else if job.Spec.ActiveDeadlineSeconds != nil && !jobSuspended(&job) {
-			syncDuration := time.Duration(*job.Spec.ActiveDeadlineSeconds)*time.Second - jm.clock.Since(job.Status.StartTime.Time)
-			logger.V(2).Info("Job has activeDeadlineSeconds configuration. Will sync this job again", "key", key, "nextSyncIn", syncDuration)
-			jm.queue.AddAfter(key, syncDuration)
-		}
-	}
-
-	if isIndexedJob(&job) {
-		jobCtx.prevSucceededIndexes, jobCtx.succeededIndexes = calculateSucceededIndexes(logger, &job, pods)
-		jobCtx.succeeded = int32(jobCtx.succeededIndexes.total())
-		if hasBackoffLimitPerIndex(&job) {
-			jobCtx.failedIndexes = calculateFailedIndexes(logger, &job, pods)
-			if jobCtx.finishedCondition == nil {
-				if job.Spec.MaxFailedIndexes != nil && jobCtx.failedIndexes.total() > int(*job.Spec.MaxFailedIndexes) {
-					jobCtx.finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, jobReasonMaxFailedIndexesExceeded, "Job has exceeded the specified maximal number of failed indexes", jm.clock.Now())
-				} else if jobCtx.failedIndexes.total() > 0 && jobCtx.failedIndexes.total()+jobCtx.succeededIndexes.total() >= int(*job.Spec.Completions) {
-					jobCtx.finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, jobReasonFailedIndexes, "Job has failed indexes", jm.clock.Now())
-				}
-			}
-			jobCtx.podsWithDelayedDeletionPerIndex = getPodsWithDelayedDeletionPerIndex(logger, jobCtx)
-		}
-	}
-	suspendCondChanged := false
-	// Remove active pods if Job failed.
-	if jobCtx.finishedCondition != nil {
-		deleted, err := jm.deleteActivePods(ctx, &job, jobCtx.activePods)
-		if deleted != active || !satisfiedExpectations {
-			// Can't declare the Job as finished yet, as there might be remaining
-			// pod finalizers or pods that are not in the informer's cache yet.
-			jobCtx.finishedCondition = nil
-		}
-		active -= deleted
-		manageJobErr = err
-	} else {
-		manageJobCalled := false
-		if satisfiedExpectations && job.DeletionTimestamp == nil {
-			active, action, manageJobErr = jm.manageJob(ctx, &job, jobCtx)
-			manageJobCalled = true
-		}
-		complete := false
-		if job.Spec.Completions == nil {
-			// This type of job is complete when any pod exits with success.
-			// Each pod is capable of
-			// determining whether or not the entire Job is done.  Subsequent pods are
-			// not expected to fail, but if they do, the failure is ignored.  Once any
-			// pod succeeds, the controller waits for remaining pods to finish, and
-			// then the job is complete.
-			complete = jobCtx.succeeded > 0 && active == 0
-		} else {
-			// Job specifies a number of completions.  This type of job signals
-			// success by having that number of successes.  Since we do not
-			// start more pods than there are remaining completions, there should
-			// not be any remaining active pods once this count is reached.
-			complete = jobCtx.succeeded >= *job.Spec.Completions && active == 0
-		}
-		if complete {
-			jobCtx.finishedCondition = newCondition(batch.JobComplete, v1.ConditionTrue, "", "", jm.clock.Now())
-		} else if manageJobCalled {
-			// Update the conditions / emit events only if manageJob was called in
-			// this syncJob. Otherwise wait for the right syncJob call to make
-			// updates.
-			if job.Spec.Suspend != nil && *job.Spec.Suspend {
-				// Job can be in the suspended state only if it is NOT completed.
-				var isUpdated bool
-				job.Status.Conditions, isUpdated = ensureJobConditionStatus(job.Status.Conditions, batch.JobSuspended, v1.ConditionTrue, "JobSuspended", "Job suspended", jm.clock.Now())
-				if isUpdated {
-					suspendCondChanged = true
-					jm.recorder.Event(&job, v1.EventTypeNormal, "Suspended", "Job suspended")
-				}
-			} else {
-				// Job not suspended.
-				var isUpdated bool
-				job.Status.Conditions, isUpdated = ensureJobConditionStatus(job.Status.Conditions, batch.JobSuspended, v1.ConditionFalse, "JobResumed", "Job resumed", jm.clock.Now())
-				if isUpdated {
-					suspendCondChanged = true
-					jm.recorder.Event(&job, v1.EventTypeNormal, "Resumed", "Job resumed")
-					// Resumed jobs will always reset StartTime to current time. This is
-					// done because the ActiveDeadlineSeconds timer shouldn't go off
-					// whilst the Job is still suspended and resetting StartTime is
-					// consistent with resuming a Job created in the suspended state.
-					// (ActiveDeadlineSeconds is interpreted as the number of seconds a
-					// Job is continuously active.)
-					now := metav1.NewTime(jm.clock.Now())
-					job.Status.StartTime = &now
-				}
-			}
-		}
-	}
-
-	needsStatusUpdate := suspendCondChanged || active != job.Status.Active || !ptr.Equal(ready, job.Status.Ready)
-	job.Status.Active = active
-	job.Status.Ready = ready
-	job.Status.Terminating = jobCtx.terminating
-	needsStatusUpdate = needsStatusUpdate || !ptr.Equal(job.Status.Terminating, jobCtx.terminating)
-	err = jm.trackJobStatusAndRemoveFinalizers(ctx, jobCtx, needsStatusUpdate)
+	var res JobResponse
+	err = mco.Send(ctx, "job", JobRequest{Job: job, Pods: pods}, &res)
 	if err != nil {
-		return fmt.Errorf("tracking status: %w", err)
+		return err
 	}
 
-	return manageJobErr
+	switch res.Action {
+	case "updatePod":
+		_, err := jm.kubeClient.CoreV1().Pods(res.Pod.ObjectMeta.Namespace).Update(ctx, res.Pod, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update pod")
+			return err
+		}
+		logger.Info("Updated pod")
+	case "createPod":
+		_, err := jm.kubeClient.CoreV1().Pods(res.Pod.ObjectMeta.Namespace).Create(ctx, res.Pod, metav1.CreateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to create pod")
+			return err
+		}
+		logger.Info("Created pod")
+	case "deletePod":
+		err := jm.kubeClient.CoreV1().Pods(res.Pod.ObjectMeta.Namespace).Delete(ctx, res.Pod.ObjectMeta.Name, metav1.DeleteOptions{})
+		if err != nil {
+			logger.Error(err, "failed to delete pod")
+			return err
+		}
+		logger.Info("Deleted pod")
+	case "":
+		logger.Info("Got no action")
+	default:
+		panic(fmt.Sprintf("got unmatched action: %v\n", res.Action))
+	}
+
+	return nil
+
+	// var terminating *int32
+	// if feature.DefaultFeatureGate.Enabled(features.JobPodReplacementPolicy) {
+	// 	terminating = ptr.To(controller.CountTerminatingPods(pods))
+	// }
+	// jobCtx := &syncJobCtx{
+	// 	job:                  &job,
+	// 	pods:                 pods,
+	// 	activePods:           controller.FilterActivePods(logger, pods),
+	// 	terminating:          terminating,
+	// 	uncounted:            newUncountedTerminatedPods(*job.Status.UncountedTerminatedPods),
+	// 	expectedRmFinalizers: jm.finalizerExpectations.getExpectedUIDs(key),
+	// }
+	// active := int32(len(jobCtx.activePods))
+	// newSucceededPods, newFailedPods := getNewFinishedPods(jobCtx)
+	// jobCtx.succeeded = job.Status.Succeeded + int32(len(newSucceededPods)) + int32(len(jobCtx.uncounted.succeeded))
+	// failed := job.Status.Failed + int32(nonIgnoredFailedPodsCount(jobCtx, newFailedPods)) + int32(len(jobCtx.uncounted.failed))
+	// var ready *int32
+	// if feature.DefaultFeatureGate.Enabled(features.JobReadyPods) {
+	// 	ready = ptr.To(countReadyPods(jobCtx.activePods))
+	// }
+	//
+	// // Job first start. Set StartTime only if the job is not in the suspended state.
+	// if job.Status.StartTime == nil && !jobSuspended(&job) {
+	// 	now := metav1.NewTime(jm.clock.Now())
+	// 	job.Status.StartTime = &now
+	// }
+	//
+	// jobCtx.newBackoffRecord = jm.podBackoffStore.newBackoffRecord(key, newSucceededPods, newFailedPods)
+	//
+	// var manageJobErr error
+	//
+	// exceedsBackoffLimit := failed > *job.Spec.BackoffLimit
+	//
+	// if feature.DefaultFeatureGate.Enabled(features.JobPodFailurePolicy) {
+	// 	if failureTargetCondition := findConditionByType(job.Status.Conditions, batch.JobFailureTarget); failureTargetCondition != nil {
+	// 		jobCtx.finishedCondition = newFailedConditionForFailureTarget(failureTargetCondition, jm.clock.Now())
+	// 	} else if failJobMessage := getFailJobMessage(&job, pods); failJobMessage != nil {
+	// 		// Prepare the interim FailureTarget condition to record the failure message before the finalizers (allowing removal of the pods) are removed.
+	// 		jobCtx.finishedCondition = newCondition(batch.JobFailureTarget, v1.ConditionTrue, batch.JobReasonPodFailurePolicy, *failJobMessage, jm.clock.Now())
+	// 	}
+	// }
+	// if jobCtx.finishedCondition == nil {
+	// 	if exceedsBackoffLimit || pastBackoffLimitOnFailure(&job, pods) {
+	// 		// check if the number of pod restart exceeds backoff (for restart OnFailure only)
+	// 		// OR if the number of failed jobs increased since the last syncJob
+	// 		jobCtx.finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, batch.JobReasonBackoffLimitExceeded, "Job has reached the specified backoff limit", jm.clock.Now())
+	// 	} else if jm.pastActiveDeadline(&job) {
+	// 		jobCtx.finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, batch.JobReasonDeadlineExceeded, "Job was active longer than specified deadline", jm.clock.Now())
+	// 	} else if job.Spec.ActiveDeadlineSeconds != nil && !jobSuspended(&job) {
+	// 		syncDuration := time.Duration(*job.Spec.ActiveDeadlineSeconds)*time.Second - jm.clock.Since(job.Status.StartTime.Time)
+	// 		logger.V(2).Info("Job has activeDeadlineSeconds configuration. Will sync this job again", "key", key, "nextSyncIn", syncDuration)
+	// 		jm.queue.AddAfter(key, syncDuration)
+	// 	}
+	// }
+	//
+	// if isIndexedJob(&job) {
+	// 	jobCtx.prevSucceededIndexes, jobCtx.succeededIndexes = calculateSucceededIndexes(logger, &job, pods)
+	// 	jobCtx.succeeded = int32(jobCtx.succeededIndexes.total())
+	// 	if hasBackoffLimitPerIndex(&job) {
+	// 		jobCtx.failedIndexes = calculateFailedIndexes(logger, &job, pods)
+	// 		if jobCtx.finishedCondition == nil {
+	// 			if job.Spec.MaxFailedIndexes != nil && jobCtx.failedIndexes.total() > int(*job.Spec.MaxFailedIndexes) {
+	// 				jobCtx.finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, jobReasonMaxFailedIndexesExceeded, "Job has exceeded the specified maximal number of failed indexes", jm.clock.Now())
+	// 			} else if jobCtx.failedIndexes.total() > 0 && jobCtx.failedIndexes.total()+jobCtx.succeededIndexes.total() >= int(*job.Spec.Completions) {
+	// 				jobCtx.finishedCondition = newCondition(batch.JobFailed, v1.ConditionTrue, jobReasonFailedIndexes, "Job has failed indexes", jm.clock.Now())
+	// 			}
+	// 		}
+	// 		jobCtx.podsWithDelayedDeletionPerIndex = getPodsWithDelayedDeletionPerIndex(logger, jobCtx)
+	// 	}
+	// }
+	// suspendCondChanged := false
+	// // Remove active pods if Job failed.
+	// if jobCtx.finishedCondition != nil {
+	// 	deleted, err := jm.deleteActivePods(ctx, &job, jobCtx.activePods)
+	// 	if deleted != active || !satisfiedExpectations {
+	// 		// Can't declare the Job as finished yet, as there might be remaining
+	// 		// pod finalizers or pods that are not in the informer's cache yet.
+	// 		jobCtx.finishedCondition = nil
+	// 	}
+	// 	active -= deleted
+	// 	manageJobErr = err
+	// } else {
+	// 	manageJobCalled := false
+	// 	if satisfiedExpectations && job.DeletionTimestamp == nil {
+	// 		active, action, manageJobErr = jm.manageJob(ctx, &job, jobCtx)
+	// 		manageJobCalled = true
+	// 	}
+	// 	complete := false
+	// 	if job.Spec.Completions == nil {
+	// 		// This type of job is complete when any pod exits with success.
+	// 		// Each pod is capable of
+	// 		// determining whether or not the entire Job is done.  Subsequent pods are
+	// 		// not expected to fail, but if they do, the failure is ignored.  Once any
+	// 		// pod succeeds, the controller waits for remaining pods to finish, and
+	// 		// then the job is complete.
+	// 		complete = jobCtx.succeeded > 0 && active == 0
+	// 	} else {
+	// 		// Job specifies a number of completions.  This type of job signals
+	// 		// success by having that number of successes.  Since we do not
+	// 		// start more pods than there are remaining completions, there should
+	// 		// not be any remaining active pods once this count is reached.
+	// 		complete = jobCtx.succeeded >= *job.Spec.Completions && active == 0
+	// 	}
+	// 	if complete {
+	// 		jobCtx.finishedCondition = newCondition(batch.JobComplete, v1.ConditionTrue, "", "", jm.clock.Now())
+	// 	} else if manageJobCalled {
+	// 		// Update the conditions / emit events only if manageJob was called in
+	// 		// this syncJob. Otherwise wait for the right syncJob call to make
+	// 		// updates.
+	// 		if job.Spec.Suspend != nil && *job.Spec.Suspend {
+	// 			// Job can be in the suspended state only if it is NOT completed.
+	// 			var isUpdated bool
+	// 			job.Status.Conditions, isUpdated = ensureJobConditionStatus(job.Status.Conditions, batch.JobSuspended, v1.ConditionTrue, "JobSuspended", "Job suspended", jm.clock.Now())
+	// 			if isUpdated {
+	// 				suspendCondChanged = true
+	// 				jm.recorder.Event(&job, v1.EventTypeNormal, "Suspended", "Job suspended")
+	// 			}
+	// 		} else {
+	// 			// Job not suspended.
+	// 			var isUpdated bool
+	// 			job.Status.Conditions, isUpdated = ensureJobConditionStatus(job.Status.Conditions, batch.JobSuspended, v1.ConditionFalse, "JobResumed", "Job resumed", jm.clock.Now())
+	// 			if isUpdated {
+	// 				suspendCondChanged = true
+	// 				jm.recorder.Event(&job, v1.EventTypeNormal, "Resumed", "Job resumed")
+	// 				// Resumed jobs will always reset StartTime to current time. This is
+	// 				// done because the ActiveDeadlineSeconds timer shouldn't go off
+	// 				// whilst the Job is still suspended and resetting StartTime is
+	// 				// consistent with resuming a Job created in the suspended state.
+	// 				// (ActiveDeadlineSeconds is interpreted as the number of seconds a
+	// 				// Job is continuously active.)
+	// 				now := metav1.NewTime(jm.clock.Now())
+	// 				job.Status.StartTime = &now
+	// 			}
+	// 		}
+	// 	}
+	// }
+	//
+	// needsStatusUpdate := suspendCondChanged || active != job.Status.Active || !ptr.Equal(ready, job.Status.Ready)
+	// job.Status.Active = active
+	// job.Status.Ready = ready
+	// job.Status.Terminating = jobCtx.terminating
+	// needsStatusUpdate = needsStatusUpdate || !ptr.Equal(job.Status.Terminating, jobCtx.terminating)
+	// err = jm.trackJobStatusAndRemoveFinalizers(ctx, jobCtx, needsStatusUpdate)
+	// if err != nil {
+	// 	return fmt.Errorf("tracking status: %w", err)
+	// }
+	//
+	// return manageJobErr
 }
 
 // deleteActivePods issues deletion for active Pods, preserving finalizers.
