@@ -9,3 +9,4 @@ run_tests statefulset
 run_tests deployment
 run_tests replicaset
 run_tests scheduler "TestUnschedulableNodes|TestAllocatable"
+run_tests job
