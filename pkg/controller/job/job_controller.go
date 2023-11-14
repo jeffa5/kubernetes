@@ -825,6 +825,14 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 			return err
 		}
 		logger.Info("Deleted pod")
+	case "updateJobStatus":
+		_, err := jm.kubeClient.BatchV1().Jobs(res.Job.ObjectMeta.Namespace).UpdateStatus(ctx, res.Job, metav1.UpdateOptions{})
+		if err != nil {
+			logger.Error(err, "failed to update job status")
+			return err
+		}
+		logger.Info("Updated job status")
+		jm.enqueueSyncJobImmediately(logger, res.Job)
 	case "":
 		logger.Info("Got no action")
 	default:
